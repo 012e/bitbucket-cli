@@ -186,17 +186,31 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, opts *listOptions) error {
 		ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
 		defer cancel()
 
+		var me *bbdc.User
+		if opts.Mine || opts.Reviewer {
+			flag := "--mine"
+			if opts.Reviewer {
+				flag = "--reviewer"
+			}
+			if host.Username == "" {
+				return fmt.Errorf("%s requires a username; bearer-only logins must re-authenticate with --username or use the dashboard endpoint (omit --project and --repo)", flag)
+			}
+			// The stored username may be a slug, login name, or email; the
+			// participant filter and author matching need the canonical user.
+			me, err = client.ResolveUser(ctx, host.Username)
+			if err != nil {
+				return fmt.Errorf("resolve current Bitbucket user %q: %w", host.Username, err)
+			}
+		}
+
 		var prs []bbdc.PullRequest
 		if opts.Reviewer {
-			if host.Username == "" {
-				return fmt.Errorf("--reviewer requires a username; bearer-only logins must re-authenticate with --username or use the dashboard endpoint (omit --project and --repo)")
-			}
 			// Apply the REVIEWER participant filter upstream (before the limit)
 			// rather than filtering a limited page client-side.
 			prs, err = client.ListPullRequestsWithOptions(ctx, projectKey, repoSlug, bbdc.RepoPullRequestsOptions{
 				State:    opts.State,
 				Role:     "REVIEWER",
-				Username: host.Username,
+				Username: me.Name,
 				Limit:    opts.Limit,
 			})
 			if err != nil {
@@ -209,14 +223,9 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, opts *listOptions) error {
 			}
 
 			if opts.Mine {
-				if host.Username == "" {
-					return fmt.Errorf("--mine requires a username; bearer-only logins must re-authenticate with --username or use the dashboard endpoint (omit --project and --repo)")
-				}
 				filtered := prs[:0]
-				current := strings.ToLower(host.Username)
 				for _, pr := range prs {
-					author := strings.ToLower(cmdutil.FirstNonEmpty(pr.Author.User.Name, pr.Author.User.Slug))
-					if author == current {
+					if isSameDCUser(pr.Author.User, *me) {
 						filtered = append(filtered, pr)
 					}
 				}
@@ -337,6 +346,15 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, opts *listOptions) error {
 	default:
 		return fmt.Errorf("unsupported host kind %q", host.Kind)
 	}
+}
+
+// isSameDCUser reports whether author is the resolved current user, preferring
+// the numeric ID and falling back to the login name or slug.
+func isSameDCUser(author, me bbdc.User) bool {
+	if author.ID != 0 && me.ID != 0 {
+		return author.ID == me.ID
+	}
+	return author.Matches(me.Name) || author.Matches(me.Slug)
 }
 
 // runListDashboardDC lists pull requests for the authenticated user across all repositories (Data Center).
