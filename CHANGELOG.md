@@ -6,9 +6,72 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-10-25
+### Changed
+- **Log in again once:** run `bkt auth login https://bitbucket.org --kind cloud --web`.
+  bkt's Bitbucket Cloud OAuth consumer now grants Repositories Admin, so
+  `bkt repo create` works with browser login; before, it failed with
+  "credentials lack one or more required privilege scopes". It also no longer
+  grants unused project-write, workspace-membership, and issue permissions.
+  Bitbucket expires every token issued before this change.
+
+### Removed
+- `bkt issue` now explains that Atlassian removed Bitbucket Cloud Issues on
+  20 August 2026 and exits, instead of calling an API that answers 410 Gone.
+  The command is hidden from help; track issues in Jira.
+
+
+## [0.36.0] - 2026-10-22
+### Fixed
+- Bitbucket Cloud browser login (`bkt auth login --kind cloud --web`) and
+  OAuth token refresh work in every build, including Homebrew core,
+  `go install`, and Nix. bkt's OAuth consumer now ships in source, as the
+  GitHub CLI and Git Credential Manager ship theirs, instead of only in
+  release binaries.
+
+### Changed
+- `BKT_OAUTH_CLIENT_ID` and `BKT_OAUTH_CLIENT_SECRET` now select your own
+  OAuth consumer over bkt's, and must be set together. Before, release
+  binaries ignored them. A stored OAuth token refreshes with the consumer that
+  issued it.
+
+
+## [0.35.2] - 2026-10-20
+### Fixed
+- macOS release binaries run on macOS 13 and later again. Releases built on the
+  `macos-latest` runner required macOS 26, so older Macs refused to start `bkt`.
+
+### Changed
+- macOS release binaries are signed with a Developer ID (Aviv Sinai,
+  93ZUZ2PTM9) and notarized by Apple. After this upgrade, macOS asks for
+  Keychain access one last time; later upgrades keep the approval.
+
+
+## [0.35.1] - 2026-10-20
+### Fixed
+- Repository auto-detection treats `ssh.bitbucket.org` remotes as Bitbucket
+  Cloud. Bitbucket Cloud moves SSH to this hostname on 12 November 2026 (#357).
+
+### Changed
+- The release workflow can sign and notarize macOS binaries with a Developer ID.
+  This release is still signed ad-hoc, so macOS asks again for Keychain access
+  after `brew upgrade`. A Developer ID release will key the Keychain grant to the
+  team ID, so one "Always Allow" then survives upgrades.
+- Build with `golang.org/x/sys` 0.49 and `golang.org/x/term` 0.47.
+
+
+## [0.35.0] - 2026-10-18
+### Added
+- Repository auto-detection resolves SSH host aliases through `ssh -G`, as
+  `gh` does, so remotes such as `git@work.bitbucket.org:team/repo.git` map to
+  their Bitbucket host (#344).
+
+
+## [0.34.0] - 2026-10-15
 ### Added
 - `bkt auth login --with-token` reads the token from stdin, so a script signs
   in without the token showing in the process list.
+
 
 ## [0.33.1] - 2026-10-13
 ### Added
@@ -802,7 +865,13 @@ All notable changes to this project will be documented here. The format follows
 ## [0.1.0] - 2025-10-26
 - Initial public release of `bkt`.
 
-[Unreleased]: https://github.com/avivsinai/bitbucket-cli/compare/v0.33.1...HEAD
+[Unreleased]: https://github.com/avivsinai/bitbucket-cli/compare/v0.37.0...HEAD
+[0.37.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.36.0...v0.37.0
+[0.36.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.35.2...v0.36.0
+[0.35.2]: https://github.com/avivsinai/bitbucket-cli/compare/v0.35.1...v0.35.2
+[0.35.1]: https://github.com/avivsinai/bitbucket-cli/compare/v0.35.0...v0.35.1
+[0.35.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.34.0...v0.35.0
+[0.34.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.33.1...v0.34.0
 [0.33.1]: https://github.com/avivsinai/bitbucket-cli/compare/v0.33.0...v0.33.1
 [0.33.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.32.1...v0.33.0
 [0.32.1]: https://github.com/avivsinai/bitbucket-cli/compare/v0.32.0...v0.32.1

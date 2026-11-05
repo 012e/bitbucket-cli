@@ -45,8 +45,8 @@ func NewCmdAuth(f *cmdutil.Factory) *cobra.Command {
 		Long: `Manage authentication credentials for Bitbucket Data Center and Cloud hosts.
 
 Tokens are stored in the OS keychain by default. For Data Center hosts, bkt
-uses Personal Access Tokens (PATs). For Bitbucket Cloud, bkt uses Atlassian
-API tokens with scopes.
+uses Personal Access Tokens (PATs). For Bitbucket Cloud, bkt uses browser
+OAuth (--web) or Atlassian API tokens with scopes.
 
 Use "bkt auth login" to add a host, "bkt auth status" to inspect stored
 credentials, and "bkt auth logout" to remove them.`,
@@ -88,12 +88,12 @@ For Data Center (--kind dc, the default), you authenticate with a Personal
 Access Token (PAT). The token needs Repository Read/Write and Project Read
 permissions. Use --web-token to open the PAT management page in your browser.
 
-For Bitbucket Cloud (--kind cloud), the simplest method is --web-token, which
-opens the Atlassian API token page and prompts for the token locally.
-Browser-based OAuth via --web works out of the box in official release
-binaries. For source and Nix builds, set BKT_OAUTH_CLIENT_ID and
-BKT_OAUTH_CLIENT_SECRET before running --web. The CLI receives a short-lived
-access token that is automatically refreshed.
+For Bitbucket Cloud (--kind cloud), the simplest method is --web, which
+logs in through Bitbucket in your browser with OAuth. The CLI receives a
+short-lived access token that it refreshes automatically. To use your own
+OAuth consumer instead of bkt's, set BKT_OAUTH_CLIENT_ID and
+BKT_OAUTH_CLIENT_SECRET. Alternatively, --web-token opens the Atlassian API
+token page and prompts for a scoped API token locally.
 
 Credentials are verified against the remote host before being stored. If no
 OS keychain is available, pass --allow-insecure-store to use encrypted file
@@ -339,8 +339,9 @@ func runLogin(cmd *cobra.Command, f *cmdutil.Factory, opts *loginOptions) error 
 
 		if opts.Web {
 			// OAuth 2.0 browser-based flow.
-			if oauth.CloudClientID() == "" || oauth.CloudClientSecret() == "" {
-				return fmt.Errorf("cloud OAuth requires BKT_OAUTH_CLIENT_ID and BKT_OAUTH_CLIENT_SECRET in the environment; use --web-token for API token login")
+			client, err := oauth.ResolveCloudClient()
+			if err != nil {
+				return err
 			}
 			if _, err := fmt.Fprintln(ios.Out, "Authenticating with Bitbucket Cloud via OAuth..."); err != nil {
 				return err
@@ -350,8 +351,8 @@ func runLogin(cmd *cobra.Command, f *cmdutil.Factory, opts *loginOptions) error 
 			defer cancel()
 
 			result, flowErr := oauth.RunFlow(ctx, oauth.FlowOptions{
-				ClientID:     oauth.CloudClientID(),
-				ClientSecret: oauth.CloudClientSecret(),
+				ClientID:     client.ID,
+				ClientSecret: client.Secret,
 				AuthorizeURL: oauth.CloudAuthorizeURL,
 				TokenURL:     oauth.CloudTokenURL,
 				Scopes:       oauth.CloudScopes(),
@@ -578,8 +579,7 @@ func runStatus(cmd *cobra.Command, f *cmdutil.Factory) error {
 			TokenSource: tokenSource,
 		}
 		if am == "oauth" && tokenSource != secret.EnvToken {
-			hs.Expires = oauthExpiryLabel(key, h)
-			hs.Refresh = oauthRefreshStatus(hs.Expires)
+			hs.Expires, hs.Refresh = oauthExpiry(key, h)
 		}
 		hosts = append(hosts, hs)
 	}
@@ -942,41 +942,35 @@ func storedTokenIsOAuthBlob(hostKey string, host *config.Host) bool {
 	return oauth.IsTokenBlob(raw)
 }
 
-// oauthExpiryLabel reads the OAuth JSON blob from the keyring and returns a
-// human-readable expiry string. Returns "" on any error (best-effort).
-func oauthExpiryLabel(hostKey string, host *config.Host) string {
+// oauthExpiry reads the OAuth JSON blob from the keyring and returns a
+// human-readable expiry and, once expired, whether bkt can refresh it.
+// Returns empty strings on any error (best-effort).
+func oauthExpiry(hostKey string, host *config.Host) (expires, refresh string) {
 	opts := []secret.Option{}
 	if host.AllowInsecureStore {
 		opts = append(opts, secret.WithAllowFileFallback(true))
 	}
 	store, err := secret.Open(opts...)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	raw, err := store.Get(secret.TokenKey(hostKey))
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	if !oauth.IsTokenBlob(raw) {
-		return ""
+		return "", ""
 	}
 	tok, err := oauth.Unmarshal(raw)
 	if err != nil {
-		return ""
+		return "", ""
 	}
-	if tok.IsExpired() {
-		return "expired"
+	if !tok.IsExpired() {
+		remaining := time.Until(tok.ExpiresAt).Truncate(time.Minute)
+		return fmt.Sprintf("%s (in %s)", tok.ExpiresAt.Format(time.RFC3339), remaining), ""
 	}
-	remaining := time.Until(tok.ExpiresAt).Truncate(time.Minute)
-	return fmt.Sprintf("%s (in %s)", tok.ExpiresAt.Format(time.RFC3339), remaining)
-}
-
-func oauthRefreshStatus(expires string) string {
-	if expires != "expired" {
-		return ""
+	if _, err := oauth.CloudClientsFor(tok); err != nil {
+		return "expired", "unavailable; " + err.Error()
 	}
-	if oauth.CloudClientID() == "" || oauth.CloudClientSecret() == "" {
-		return "unavailable; set BKT_OAUTH_CLIENT_ID and BKT_OAUTH_CLIENT_SECRET to refresh OAuth, or run `bkt auth login https://bitbucket.org --kind cloud --web-token` to replace it with a scoped API token"
-	}
-	return "available"
+	return "expired", "available"
 }
