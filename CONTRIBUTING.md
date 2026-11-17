@@ -48,7 +48,7 @@ cmd/bkt/          CLI entry point
 cmd/docgen/       generates skills/bkt/rules from command help
 internal/bktcmd/  Main() wiring (factory + root command)
 internal/build/   version metadata (set via ldflags)
-internal/config/  contexts and hosts in $XDG_CONFIG_HOME/bkt
+internal/config/  contexts and hosts in the bkt config directory
 internal/remote/  git remote parsing
 internal/secret/  OS keychain and encrypted file store
 pkg/cmd/          Cobra commands (auth, repo, pr, ...)
@@ -79,9 +79,10 @@ We aim to respond within two business days.
 
 ## Releases
 
-Maintainers release with `./scripts/release.sh X.Y.Z`, which opens a release
-PR. After it merges, CI tags the commit and publishes binaries, packages, and
-SBOMs. See [`docs/RELEASE.md`](docs/RELEASE.md).
+Maintainers cut a release from GitHub Actions (**Actions → Release request**)
+or with `./scripts/release.sh X.Y.Z`. Either path opens a release PR. After it
+merges, CI tags the commit and publishes binaries, packages, and SBOMs. See
+[`docs/RELEASE.md`](docs/RELEASE.md).
 
 ## Community roles
 

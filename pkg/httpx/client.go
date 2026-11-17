@@ -101,9 +101,8 @@ type RateLimit struct {
 }
 
 type cacheEntry struct {
-	etag     string
-	body     []byte
-	storedAt time.Time
+	etag string
+	body []byte
 }
 
 // New constructs a Client from options.
@@ -167,8 +166,44 @@ func New(opts Options) (*Client, error) {
 	client.retry = policy
 	client.tokenRefresher = opts.TokenRefresher
 	client.requestHook = opts.RequestHook
+	client.httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if via[0].Context().Value(noRedirectsKey{}) == true {
+			return http.ErrUseLastResponse
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		return nil
+	}
 
 	return client, nil
+}
+
+// checkOrigin refuses a URL that does not point at the configured server.
+// Every request carries the stored credentials, so a URL for another host,
+// port, or scheme would hand them to that server (or send them in clear
+// text over http).
+func (c *Client) checkOrigin(u *url.URL) error {
+	if strings.EqualFold(u.Scheme, c.baseURL.Scheme) &&
+		strings.EqualFold(u.Hostname(), c.baseURL.Hostname()) &&
+		effectivePort(u) == effectivePort(c.baseURL) {
+		return nil
+	}
+	return fmt.Errorf("refusing to send credentials to %s; requests go only to %s://%s", strings.TrimPrefix(u.Scheme+"://"+u.Host, ":"), c.baseURL.Scheme, c.baseURL.Host)
+}
+
+// effectivePort returns the URL's port, or the default port of its scheme.
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
 }
 
 // NewRequest builds an HTTP request relative to the base URL. Body values are
@@ -193,6 +228,14 @@ func (c *Client) NewRequest(ctx context.Context, method, path string, body any) 
 		rel, err = url.Parse(path)
 		if err != nil {
 			return nil, fmt.Errorf("parse request path: %w", err)
+		}
+	}
+
+	// A reference that names its own server, including the protocol-relative
+	// form "//host/path", must point at the configured one.
+	if rel.Scheme != "" || rel.Host != "" {
+		if err := c.checkOrigin(rel); err != nil {
+			return nil, err
 		}
 	}
 
@@ -355,8 +398,39 @@ func (c *Client) applyRequestHook(req *http.Request) {
 	}
 }
 
+// Response records the last HTTP response received by DoWithResponse. Its body
+// has already been consumed and closed, just as with Do.
+type Response struct {
+	StatusCode int
+	Header     http.Header
+}
+
+type noRedirectsKey struct{}
+
+// WithoutRedirects keeps the original response when an endpoint must not
+// redirect. Cancellation and deadlines of ctx are preserved.
+func WithoutRedirects(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noRedirectsKey{}, true)
+}
+
 // Do executes the HTTP request and decodes the response into v when provided.
 func (c *Client) Do(req *http.Request, v any) error {
+	return c.do(req, v, nil)
+}
+
+// DoWithResponse also returns status and headers, including on HTTP or decoding
+// errors. It uses the same retry, OAuth refresh, and cancellation path as Do.
+// The response is nil if no HTTP response was received.
+func (c *Client) DoWithResponse(req *http.Request, v any) (*Response, error) {
+	var response Response
+	err := c.do(req, v, &response)
+	if response.StatusCode == 0 {
+		return nil, err
+	}
+	return &response, err
+}
+
+func (c *Client) do(req *http.Request, v any, response *Response) error {
 	if req == nil {
 		return fmt.Errorf("request is nil")
 	}
@@ -401,6 +475,9 @@ func (c *Client) Do(req *http.Request, v any) error {
 			continue
 		}
 
+		if response != nil {
+			*response = Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone()}
+		}
 		c.updateRateLimit(resp)
 		if err := c.applyAdaptiveThrottle(req.Context()); err != nil {
 			_ = resp.Body.Close()
@@ -464,9 +541,6 @@ func (c *Client) Do(req *http.Request, v any) error {
 			// Drain and discard response body when caller doesn't need it; errors are intentionally ignored
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			if c.enableCache && attemptReq.Method == http.MethodGet {
-				c.storeCache(attemptReq, nil, resp.Header.Get("ETag"))
-			}
 			return nil
 		}
 
@@ -736,6 +810,12 @@ func (c *Client) backoff(ctx context.Context, attempts int, resp *http.Response)
 
 	delay := c.retryDelay(attempts, resp)
 
+	// Waiting past the deadline only turns the real cause into
+	// "context deadline exceeded"; let the caller report the response instead.
+	if deadline, ok := ctx.Deadline(); ok && time.Now().Add(delay).After(deadline) {
+		return false, nil
+	}
+
 	if delay <= 0 {
 		select {
 		case <-ctx.Done():
@@ -774,7 +854,7 @@ func (c *Client) storeCache(req *http.Request, body []byte, etag string) {
 		return
 	}
 	c.cacheMu.Lock()
-	c.cache[c.cacheKey(req)] = &cacheEntry{etag: etag, body: append([]byte(nil), body...), storedAt: time.Now()}
+	c.cache[c.cacheKey(req)] = &cacheEntry{etag: etag, body: append([]byte(nil), body...)}
 	c.cacheMu.Unlock()
 }
 
@@ -923,6 +1003,14 @@ func (c *Client) NewMultipartRequest(ctx context.Context, method, path string, f
 		rel, err = url.Parse(path)
 		if err != nil {
 			return nil, fmt.Errorf("parse request path: %w", err)
+		}
+	}
+
+	// A reference that names its own server, including the protocol-relative
+	// form "//host/path", must point at the configured one.
+	if rel.Scheme != "" || rel.Host != "" {
+		if err := c.checkOrigin(rel); err != nil {
+			return nil, err
 		}
 	}
 

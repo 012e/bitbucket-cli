@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -71,6 +72,7 @@ type loginOptions struct {
 	Web                bool
 	WebToken           bool
 	WithToken          bool
+	Alias              string
 }
 
 func newLoginCmd(f *cmdutil.Factory) *cobra.Command {
@@ -99,7 +101,15 @@ Credentials are verified against the remote host before being stored. If no
 OS keychain is available, pass --allow-insecure-store to use encrypted file
 fallback. In non-interactive environments, provide --username and pipe the
 token on stdin with --with-token (--token also works, but the process list
-shows it).`,
+shows it).
+
+Credentials are stored per host, keyed by the server's host name. To use
+several accounts on one server, for example two Bitbucket Cloud accounts,
+log in again with --alias: the second account gets a host entry and keychain
+item of its own under that name, and a context selects it with
+` + "`bkt context create <name> --host <alias>`" + `.
+Alias names share the OS keychain namespace across config directories;
+use distinct aliases even when BKT_CONFIG_DIR differs.`,
 		Example: `  # Login to Bitbucket Cloud via OAuth
   bkt auth login https://bitbucket.org --kind cloud --web
 
@@ -113,7 +123,11 @@ shows it).`,
   bkt auth login https://bitbucket.example.com --web-token
 
   # Non-interactive login with flags (CI pipelines)
-  bkt auth login https://bitbucket.example.com --username admin --with-token < pat.txt`,
+  bkt auth login https://bitbucket.example.com --username admin --with-token < pat.txt
+
+  # A second Bitbucket Cloud account, used by its own context
+  bkt auth login https://bitbucket.org --kind cloud --web --alias team-b
+  bkt context create team-b --host team-b --workspace team-b-workspace`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) > 0 {
@@ -126,12 +140,13 @@ shows it).`,
 	cmd.Flags().StringVar(&opts.Kind, "kind", opts.Kind, "Bitbucket deployment kind (dc or cloud)")
 	cmd.Flags().StringVar(&opts.Username, "username", "", "Username (DC: PAT owner, Cloud: Atlassian email for API tokens)")
 	cmd.Flags().StringVar(&opts.Token, "token", "", "Authentication token (DC: PAT, Cloud: API token). WARNING: visible in process list and shell history; prefer the interactive prompt")
-	cmd.Flags().StringVar(&opts.AuthMethod, "auth-method", "basic", "Authentication method: basic (username+token) or bearer (token-only)")
+	cmd.Flags().StringVar(&opts.AuthMethod, "auth-method", "", "Authentication method: bearer (token-only; Data Center default) or basic (username+token; Cloud default)")
 	cmd.Flags().BoolVar(&opts.AllowInsecureStore, "allow-insecure-store", false, "Allow encrypted fallback secret storage when no OS keychain is available")
 	cmd.Flags().BoolVar(&opts.AllowHTTP, "allow-http", false, "Allow http:// URLs for login even though credentials will be sent in plaintext")
 	cmd.Flags().BoolVarP(&opts.Web, "web", "w", false, "Authenticate via OAuth in the browser (Cloud only)")
 	cmd.Flags().BoolVar(&opts.WebToken, "web-token", false, "Open browser to create an API token, then prompt for credentials")
 	cmd.Flags().BoolVar(&opts.WithToken, "with-token", false, "Read the token from standard input")
+	cmd.Flags().StringVar(&opts.Alias, "alias", "", "Store the credentials under this host name instead of the server's, to log in to one server with several accounts")
 
 	return cmd
 }
@@ -184,9 +199,16 @@ func runLogin(cmd *cobra.Command, f *cmdutil.Factory, opts *loginOptions) error 
 		kind = "cloud"
 	}
 
+	// Data Center defaults to bearer: a server can answer 401 even with
+	// correct credentials (for example to a path outside a REST plugin), and
+	// under basic auth each 401 can count as a failed password login until the
+	// account is locked. A bearer token is never checked as a password.
 	authMethod := strings.ToLower(strings.TrimSpace(opts.AuthMethod))
 	if authMethod == "" {
 		authMethod = "basic"
+		if kind == "dc" {
+			authMethod = "bearer"
+		}
 	}
 	if authMethod != "basic" && authMethod != "bearer" {
 		return fmt.Errorf("unsupported auth method %q; use \"basic\" or \"bearer\"", authMethod)
@@ -219,7 +241,7 @@ func runLogin(cmd *cobra.Command, f *cmdutil.Factory, opts *loginOptions) error 
 
 	switch kind {
 	case "dc":
-		hostKey, err = cmdutil.HostKeyFromURL(baseURL)
+		hostKey, err = loginHostKey(cfg, opts.Alias, baseURL, kind)
 		if err != nil {
 			return err
 		}
@@ -242,15 +264,21 @@ func runLogin(cmd *cobra.Command, f *cmdutil.Factory, opts *loginOptions) error 
 			}
 		}
 
-		if authMethod != "bearer" {
-			if opts.Username == "" {
-				if !isTerminal(ios.In) {
-					return fmt.Errorf("username is required when not running in a TTY")
+		// Bearer does not need a username, but pr list --mine and --reviewer
+		// do, so an interactive login still asks for it.
+		if opts.Username == "" {
+			switch {
+			case isTerminal(ios.In):
+				label := "Username (use x-token-auth for project/repo tokens)"
+				if authMethod == "bearer" {
+					label = "Username (the token's owner; Enter to skip)"
 				}
-				opts.Username, err = promptString(reader, ios.Out, "Username (use x-token-auth for project/repo tokens)")
+				opts.Username, err = promptString(reader, ios.Out, label)
 				if err != nil {
 					return err
 				}
+			case authMethod != "bearer":
+				return fmt.Errorf("username is required when not running in a TTY")
 			}
 		}
 
@@ -332,7 +360,7 @@ func runLogin(cmd *cobra.Command, f *cmdutil.Factory, opts *loginOptions) error 
 			apiURL = "https://api.bitbucket.org/2.0"
 		}
 
-		hostKey, err = cmdutil.HostKeyFromURL(apiURL)
+		hostKey, err = loginHostKey(cfg, opts.Alias, apiURL, kind)
 		if err != nil {
 			return err
 		}
@@ -502,6 +530,74 @@ func runLogin(cmd *cobra.Command, f *cmdutil.Factory, opts *loginOptions) error 
 	return nil
 }
 
+// loginHostKey returns the config key that a login stores its host entry and
+// token under: the server's own key, or the alias when one is given. An alias
+// may not take over an entry that points at another server.
+func loginHostKey(cfg *config.Config, alias, baseURL, kind string) (string, error) {
+	serverKey, err := cmdutil.HostKeyFromURL(baseURL)
+	if err != nil {
+		return "", err
+	}
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		alias = serverKey
+	} else if !validAlias(alias) {
+		return "", fmt.Errorf("invalid --alias %q: use letters, digits, '.', '_' or '-'", alias)
+	}
+	endpoint, err := loginEndpoint(baseURL)
+	if err != nil {
+		return "", err
+	}
+	if existing, ok := cfg.Hosts[alias]; ok {
+		if existing == nil {
+			return "", fmt.Errorf("host key %q already names a host with invalid configuration; choose another alias", alias)
+		}
+		existingEndpoint, parseErr := loginEndpoint(existing.BaseURL)
+		if parseErr != nil || existingEndpoint != endpoint || existing.Kind != kind {
+			return "", fmt.Errorf("host key %q already names a host for %s; choose another alias or run `bkt auth logout --host %s` first", alias, existing.BaseURL, alias)
+		}
+	}
+	return alias, nil
+}
+
+// The deployment path is part of the identity: one origin may serve multiple
+// Data Center installations. Normalize harmless spelling differences only.
+func loginEndpoint(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil || u.Hostname() == "" || u.User != nil ||
+		(u.Scheme != "https" && u.Scheme != "http") || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("invalid login base URL %q", raw)
+	}
+	host, port := strings.ToLower(u.Hostname()), u.Port()
+	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	u.Host = host
+	u.RawPath = strings.TrimRight(u.EscapedPath(), "/")
+	u.Path, err = url.PathUnescape(u.RawPath)
+	if err != nil {
+		return "", fmt.Errorf("invalid login base URL %q: %w", raw, err)
+	}
+	return u.String(), nil
+}
+
+func validAlias(alias string) bool {
+	for _, r := range alias {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.' || r == '_' || r == '-':
+		default:
+			return false
+		}
+	}
+	return alias != ""
+}
+
 func newStatusCmd(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status",
@@ -514,12 +610,12 @@ cloud), the stored username, and the token source (OS keychain or the
 BKT_TOKEN environment variable). Configured contexts are listed with their
 associated host, project/workspace, and default repository.
 
-Use --output json to get machine-readable output suitable for scripting.`,
+Use --json to get machine-readable output suitable for scripting.`,
 		Example: `  # Show all configured hosts and contexts
   bkt auth status
 
   # Get status as JSON
-  bkt auth status --output json`,
+  bkt auth status --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runStatus(cmd, f)
 		},
@@ -564,11 +660,10 @@ func runStatus(cmd *cobra.Command, f *cmdutil.Factory) error {
 	}
 	sort.Strings(hostKeys)
 
-	tokenSource := resolvedTokenSource()
-
-	var hosts []hostSummary
+	hosts := []hostSummary{}
 	for _, key := range hostKeys {
 		h := cfg.Hosts[key]
+		tokenSource := resolvedTokenSource(key, h)
 		am := detectedAuthMethod(key, h, tokenSource)
 		hs := hostSummary{
 			Key:         key,
@@ -590,7 +685,7 @@ func runStatus(cmd *cobra.Command, f *cmdutil.Factory) error {
 	}
 	sort.Strings(contextNames)
 
-	var contexts []contextSummary
+	contexts := []contextSummary{}
 	for _, name := range contextNames {
 		ctx := cfg.Contexts[name]
 		contexts = append(contexts, contextSummary{
@@ -625,7 +720,11 @@ func runStatus(cmd *cobra.Command, f *cmdutil.Factory) error {
 			return err
 		}
 		for _, h := range hosts {
-			if _, err := fmt.Fprintf(ios.Out, "  %s (%s)\n", h.BaseURL, h.Kind); err != nil {
+			label := h.BaseURL
+			if cmdutil.IsHostAlias(h.Key, cfg.Hosts[h.Key]) {
+				label = h.Key + ": " + h.BaseURL
+			}
+			if _, err := fmt.Fprintf(ios.Out, "  %s (%s)\n", label, h.Kind); err != nil {
 				return err
 			}
 			if h.Username != "" {
@@ -894,11 +993,12 @@ func isTerminal(in io.Reader) bool {
 	return ok && term.IsTerminal(int(file.Fd()))
 }
 
-// resolvedTokenSource returns the active token resolution strategy.
-// When BKT_TOKEN is set it applies globally to all hosts; otherwise
-// the strategy is keyring-based (actual token presence is not checked).
-func resolvedTokenSource() string {
-	if secret.TokenFromEnv() != "" {
+// resolvedTokenSource returns the token resolution strategy for a host.
+// BKT_TOKEN applies to every host, or only to the BKT_HOST server when
+// BKT_HOST is set; otherwise the strategy is keyring-based (actual token
+// presence is not checked).
+func resolvedTokenSource(hostKey string, host *config.Host) string {
+	if cmdutil.EnvTokenAppliesTo(hostKey, host) {
 		return secret.EnvToken
 	}
 	return "keyring"
@@ -908,6 +1008,11 @@ func detectedAuthMethod(hostKey string, host *config.Host, tokenSource string) s
 	if tokenSource == secret.EnvToken {
 		if m := strings.TrimSpace(os.Getenv(secret.EnvAuthMethod)); m != "" {
 			return m
+		}
+		// Without BKT_AUTH_METHOD the saved method stays in force, except
+		// OAuth: an env token for an OAuth-saved host is sent as basic auth.
+		if host != nil && host.AuthMethod != "" && host.AuthMethod != "oauth" {
+			return host.AuthMethod
 		}
 		return "basic"
 	}

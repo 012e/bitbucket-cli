@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -382,5 +383,108 @@ func TestPath(t *testing.T) {
 	cfg := &Config{path: "/tmp/test/config.yml"}
 	if got := cfg.Path(); got != "/tmp/test/config.yml" {
 		t.Fatalf("Path() = %q, want %q", got, "/tmp/test/config.yml")
+	}
+}
+
+// A hand-edited config with an empty entry ("contexts: {work: }") decodes to
+// a nil pointer; every command then panicked on the active context.
+func TestLoadTreatsEmptyContextAndHostEntriesAsMissing(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BKT_CONFIG_DIR", dir)
+	data := "active_context: work\ncontexts:\n  work:\nhosts:\n  main:\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yml"), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if ctx, err := cfg.Context("work"); !errors.Is(err, ErrContextNotFound) {
+		t.Fatalf("Context = %v, %v; want ErrContextNotFound", ctx, err)
+	}
+	if host, err := cfg.Host("main"); !errors.Is(err, ErrHostNotFound) {
+		t.Fatalf("Host = %v, %v; want ErrHostNotFound", host, err)
+	}
+}
+
+// A config written by an old bkt can hold a plaintext token. Any save, for
+// example `bkt context create`, used to delete it before the user had moved
+// it to the keychain, so the next command had no credentials.
+func TestSaveKeepsPlaintextTokenThatWasReadFromTheFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BKT_CONFIG_DIR", dir)
+	path := filepath.Join(dir, "config.yml")
+	data := "hosts:\n  main:\n    kind: dc\n    base_url: https://bitbucket.example.com\n    token: legacy\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cfg.SetContext("work", &Context{Host: "main"})
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load after Save: %v", err)
+	}
+	if got := reloaded.Hosts["main"].Token; got != "legacy" {
+		t.Fatalf("token after save = %q, want the token that was in the file", got)
+	}
+}
+
+func TestHostKeyFromLoadAndSetHost(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BKT_CONFIG_DIR", dir)
+
+	data := []byte(`version: 1
+hosts:
+    api.bitbucket.org:
+        kind: cloud
+        base_url: https://api.bitbucket.org/2.0
+    team-b:
+        kind: cloud
+        base_url: https://api.bitbucket.org/2.0
+        username: shared@example.com
+`)
+	if err := os.WriteFile(filepath.Join(dir, "config.yml"), data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for key, host := range cfg.Hosts {
+		if host.Key() != key {
+			t.Errorf("Hosts[%q].Key() = %q, want %q", key, host.Key(), key)
+		}
+	}
+
+	h := &Host{Kind: "cloud", BaseURL: "https://api.bitbucket.org/2.0"}
+	cfg.SetHost("team-c", h)
+	if h.Key() != "team-c" {
+		t.Errorf("Key() after SetHost = %q, want team-c", h.Key())
+	}
+
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	saved, err := os.ReadFile(filepath.Join(dir, "config.yml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(saved), "key:") {
+		t.Errorf("runtime key leaked into config.yml:\n%s", saved)
+	}
+
+	var nilHost *Host
+	if nilHost.Key() != "" {
+		t.Error("nil Host.Key() should be empty")
 	}
 }

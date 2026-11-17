@@ -349,6 +349,8 @@ func TestListWorkspaceCloud(t *testing.T) {
 			State:     "OPEN",
 			CreatedOn: "not-a-timestamp",
 		},
+		{ID: 3, Title: "Merged PR", State: "MERGED"},
+		{ID: 4, Title: "Declined PR", State: "DECLINED"},
 	}
 	// Set nested fields - use Destination.Repository.Slug as primary source
 	prs[0].Source.Branch.Name = "feature-1"
@@ -423,14 +425,21 @@ func TestListWorkspaceCloud(t *testing.T) {
 		},
 	}
 
-	cmd := newListCmd(f)
-	cmd.SilenceErrors = true
-	cmd.SilenceUsage = true
-	cmd.SetArgs([]string{"--mine"})
-
-	err = cmd.Execute()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	for _, args := range [][]string{{"--mine"}, {"--mine", "--state", "OPEN"}} {
+		stdout.Reset()
+		cmd := newListCmd(f)
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("args=%v: unexpected error: %v", args, err)
+		}
+		if output := stdout.String(); strings.Contains(output, "Merged PR") || strings.Contains(output, "Declined PR") {
+			t.Errorf("args=%v: expected only open PRs, got:\n%s", args, output)
+		}
+		if output := stdout.String(); !strings.Contains(output, "First PR") || !strings.Contains(output, "Second PR") {
+			t.Errorf("args=%v: expected both open PRs, got:\n%s", args, output)
+		}
 	}
 
 	output := stdout.String()
@@ -5657,6 +5666,38 @@ func runGitPRTestOutput(t *testing.T, dir string, args ...string) string {
 	return string(output)
 }
 
+// `bkt pr create --source feature-x` run from another branch derived the
+// default title from HEAD's commits instead of feature-x's.
+func TestDefaultGitPRTitleUsesSourceRef(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+	dir := t.TempDir()
+	runGitPRTest(t, dir, "init", "-b", "main")
+	runGitPRTest(t, dir, "config", "user.name", "Test User")
+	runGitPRTest(t, dir, "config", "user.email", "test@example.com")
+	writeTestFile(t, filepath.Join(dir, "README.md"), "base\n")
+	runGitPRTest(t, dir, "add", "README.md")
+	runGitPRTest(t, dir, "commit", "-m", "chore: base")
+
+	runGitPRTest(t, dir, "checkout", "-b", "feature-x")
+	writeTestFile(t, filepath.Join(dir, "x.txt"), "x\n")
+	runGitPRTest(t, dir, "add", "x.txt")
+	runGitPRTest(t, dir, "commit", "-m", "feat: from feature-x")
+
+	runGitPRTest(t, dir, "checkout", "-b", "other", "main")
+
+	withWorkingDir(t, dir, func() {
+		got, err := defaultGitPRTitle(context.Background(), "main", "", "feature-x")
+		if err != nil {
+			t.Fatalf("defaultGitPRTitle: %v", err)
+		}
+		if got != "feat: from feature-x" {
+			t.Fatalf("title = %q, want feature-x's commit subject", got)
+		}
+	})
+}
+
 func TestCommentPendingFlagDC(t *testing.T) {
 	var gotBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -6345,6 +6386,51 @@ func TestListRepositoryDCReviewerFiltersUpstreamBeforeLimit(t *testing.T) {
 	}
 }
 
+// --mine on a Data Center repository used to fetch the first --limit pull
+// requests and filter by author afterwards, so a user whose pull requests
+// were older than the newest --limit saw none of them.
+func TestListRepositoryDCMineFiltersUpstreamBeforeLimit(t *testing.T) {
+	var gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/rest/api/1.0/users/testuser" {
+			_ = json.NewEncoder(w).Encode(bbdc.User{Name: "testuser", Slug: "testuser", ID: 1})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/pull-requests") {
+			gotQuery = r.URL.RawQuery
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values":     []bbdc.PullRequest{{ID: 7, Title: "Mine", State: "OPEN"}},
+				"isLastPage": true,
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		ActiveContext: "default",
+		Contexts:      map[string]*config.Context{"default": {Host: "main", ProjectKey: "PROJ", DefaultRepo: "repo1"}},
+		Hosts:         map[string]*config.Host{"main": {Kind: "dc", BaseURL: server.URL, Username: "testuser", Token: "t"}},
+	}
+	var out, errb strings.Builder
+	cmd := newListCmd(newReviewerTestFactory(cfg, &out, &errb))
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	cmd.SetArgs([]string{"--mine", "--limit", "5"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{"role.1=AUTHOR", "username.1=testuser", "limit=5"} {
+		if !strings.Contains(gotQuery, want) {
+			t.Fatalf("upstream query %q missing %q", gotQuery, want)
+		}
+	}
+	if !strings.Contains(out.String(), "#7") {
+		t.Fatalf("output missing PR #7: %s", out.String())
+	}
+}
+
 func TestListRepositoryCloudReviewerMissingIdentityError(t *testing.T) {
 	origWd, _ := os.Getwd()
 	tmpDir := t.TempDir()
@@ -6412,26 +6498,24 @@ func newSlugUserListCmd(t *testing.T, handler http.Handler, out, errb *strings.B
 	return cmd
 }
 
-func TestListRepositoryDCMineMatchesAuthorWhenSlugDiffersFromLoginName(t *testing.T) {
+func TestListRepositoryDCMineSendsLoginNameWhenSlugStored(t *testing.T) {
 	var gotQuery string
-	author := func(name, slug string, id int) bbdc.PullRequest {
-		var pr bbdc.PullRequest
-		pr.Author.User = bbdc.User{Name: name, Slug: slug, ID: id}
-		return pr
-	}
-	mine := author("jane@corp.example", "jane_corp.example", 42)
+	var mine bbdc.PullRequest
 	mine.ID, mine.Title, mine.State = 1, "Mine", "OPEN"
-	theirs := author("bob", "bob", 7)
-	theirs.ID, theirs.Title, theirs.State = 2, "Theirs", "OPEN"
 
 	var out, errb strings.Builder
-	cmd := newSlugUserListCmd(t, dcSlugUserHandler(t, &gotQuery, []bbdc.PullRequest{mine, theirs}), &out, &errb)
+	cmd := newSlugUserListCmd(t, dcSlugUserHandler(t, &gotQuery, []bbdc.PullRequest{mine}), &out, &errb)
 	cmd.SetArgs([]string{"--mine"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(out.String(), "#1") || strings.Contains(out.String(), "#2") {
-		t.Fatalf("output = %q, want only PR #1", out.String())
+	for _, want := range []string{"role.1=AUTHOR", "username.1=" + url.QueryEscape("jane@corp.example")} {
+		if !strings.Contains(gotQuery, want) {
+			t.Fatalf("upstream query %q missing %q", gotQuery, want)
+		}
+	}
+	if !strings.Contains(out.String(), "#1") {
+		t.Fatalf("output = %q, want PR #1", out.String())
 	}
 }
 

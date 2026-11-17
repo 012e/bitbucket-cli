@@ -60,7 +60,7 @@ belong to any particular branch or pull request.`,
   bkt status commit 6f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a
 
   # Output as JSON
-  bkt status commit abc1234 --output json`,
+  bkt status commit abc1234 --json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCommit(cmd, f, args[0])
@@ -85,12 +85,7 @@ func runCommit(cmd *cobra.Command, f *cmdutil.Factory, sha string) error {
 		return fmt.Errorf("status commit currently supports Data Center contexts only")
 	}
 
-	client, err := bbdc.New(bbdc.Options{
-		BaseURL:    host.BaseURL,
-		Username:   host.Username,
-		Token:      host.Token,
-		AuthMethod: host.AuthMethod,
-	})
+	client, err := cmdutil.NewDCClient(host)
 	if err != nil {
 		return err
 	}
@@ -130,7 +125,7 @@ contexts only.`,
   bkt status pr 42 --project MYPROJ --repo my-service
 
   # Output as JSON
-  bkt status pr 42 --output json`,
+  bkt status pr 42 --json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, err := strconv.Atoi(args[0])
@@ -178,12 +173,7 @@ func runPullRequest(cmd *cobra.Command, f *cmdutil.Factory, prID int, opts *prOp
 		return fmt.Errorf("repository slug required; pass --repo or set the context default")
 	}
 
-	client, err := bbdc.New(bbdc.Options{
-		BaseURL:    host.BaseURL,
-		Username:   host.Username,
-		Token:      host.Token,
-		AuthMethod: host.AuthMethod,
-	})
+	client, err := cmdutil.NewDCClient(host)
 	if err != nil {
 		return err
 	}

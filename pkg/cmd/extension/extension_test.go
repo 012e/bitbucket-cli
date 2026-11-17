@@ -1,6 +1,7 @@
 package extension
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -27,6 +28,10 @@ func TestValidateExtensionName(t *testing.T) {
 		{name: "rejects slash", input: "demo/test", wantErr: `invalid extension name "demo/test": must not contain path separators or '..'`},
 		{name: "rejects backslash", input: `demo\test`, wantErr: `invalid extension name "demo\\test": must not contain path separators or '..'`},
 		{name: "rejects traversal", input: "../demo", wantErr: `invalid extension name "../demo": must not contain path separators or '..'`},
+		// "." resolves to the extensions directory itself; `bkt extension
+		// remove .` used to delete every installed extension.
+		{name: "rejects current directory", input: ".", wantErr: `invalid extension name ".": must not be only dots or spaces`},
+		{name: "rejects current directory with a trailing space", input: ". ", wantErr: `invalid extension name ". ": must not be only dots or spaces`},
 	}
 
 	for _, tt := range tests {
@@ -133,6 +138,47 @@ func TestRunExtensionExecFiltersSensitiveEnv(t *testing.T) {
 	}
 }
 
+// `bkt extension exec lint --fix`, the documented example, used to fail with
+// "unknown flag: --fix" because bkt parsed the extension's flags as its own.
+func TestExtensionExecForwardsFlagsAfterName(t *testing.T) {
+	f, _, _ := newExtensionTestFactory(t)
+	cmd := newExecCmd(f)
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	cmd.SetArgs([]string{"lint", "--fix", "--verbose"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), `extension "lint" is not installed`) {
+		t.Fatalf("error = %v, want the flags forwarded and the missing extension reported", err)
+	}
+}
+
+// An extension exiting with code 3 made bkt print "Error: exit status 3" and exit 1.
+func TestRunExtensionExecPassesThroughExitCode(t *testing.T) {
+	f, _, _ := newExtensionTestFactory(t)
+	cfg, err := f.ResolveConfig()
+	if err != nil {
+		t.Fatalf("ResolveConfig: %v", err)
+	}
+
+	t.Setenv("GO_WANT_EXTENSION_HELPER_PROCESS", "1")
+	t.Setenv("EXTENSION_HELPER_EXIT3", "1")
+
+	helperPath := filepath.Join(extensionRootForTest(cfg), helperExecutableName("demo"))
+	if err := os.MkdirAll(filepath.Dir(helperPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	copyTestBinary(t, helperPath)
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(t.Context())
+
+	err = runExtensionExec(cmd, f, "demo", []string{"-test.run=TestExtensionHelperProcess"})
+	var exitErr *cmdutil.ExitError
+	if !errors.As(err, &exitErr) || exitErr.Code != 3 || exitErr.Msg != "" {
+		t.Fatalf("error = %#v, want silent ExitError code 3", err)
+	}
+}
+
 func TestExtensionHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_EXTENSION_HELPER_PROCESS") != "1" {
 		return
@@ -144,6 +190,9 @@ func TestExtensionHelperProcess(t *testing.T) {
 		os.Getenv("BKT_ALLOW_INSECURE_STORE"),
 		os.Getenv("BKT_EXTENSION_NAME"),
 	)
+	if os.Getenv("EXTENSION_HELPER_EXIT3") == "1" {
+		os.Exit(3)
+	}
 	os.Exit(0)
 }
 

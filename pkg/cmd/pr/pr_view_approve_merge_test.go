@@ -163,6 +163,32 @@ func TestPRViewCloudWeb(t *testing.T) {
 	}
 }
 
+// The help says `pr view` shows reviewers, but the Cloud output never listed them.
+func TestPRViewCloudShowsReviewers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repositories/myworkspace/my-repo/pullrequests/7" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":        7,
+				"title":     "Cloud PR",
+				"state":     "OPEN",
+				"reviewers": []map[string]any{{"display_name": "Rita Reviewer", "username": "rita"}},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	stdout, stderr, err := runCLI(t, cloudConfig(srv.URL), "pr", "view", "7")
+	if err != nil {
+		t.Fatalf("pr view error: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "Reviewers:\n  Rita Reviewer") {
+		t.Fatalf("stdout missing reviewer:\n%s", stdout)
+	}
+}
+
 func TestPRApproveDataCenter(t *testing.T) {
 	var approveCalled bool
 
@@ -314,7 +340,7 @@ func TestPRMergeCloud(t *testing.T) {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&mergeBody)
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 42, "state": "MERGED"})
 			return
 		}
 
@@ -340,6 +366,36 @@ func TestPRMergeCloud(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Merged pull request #42") {
 		t.Fatalf("unexpected stdout: %s", stdout)
+	}
+}
+
+func TestPRMergeCloudUnconfirmedDoesNotReportMerged(t *testing.T) {
+	for _, tt := range []struct {
+		name, body string
+		status     int
+	}{
+		{"accepted without task", `""`, http.StatusAccepted},
+		{"synchronous HTML", `<html>Sign in</html>`, http.StatusOK},
+		{"synchronous open PR", `{"id":42,"state":"OPEN"}`, http.StatusOK},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var posts int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					posts++
+				}
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			t.Cleanup(srv.Close)
+			stdout, _, err := runCLI(t, cloudConfig(srv.URL), "pr", "merge", "42")
+			if err == nil || !strings.Contains(err.Error(), "completion is unknown") {
+				t.Fatalf("error = %v", err)
+			}
+			if strings.Contains(stdout, "Merged pull request") || posts != 1 {
+				t.Fatalf("stdout = %q, merge POSTs = %d", stdout, posts)
+			}
+		})
 	}
 }
 

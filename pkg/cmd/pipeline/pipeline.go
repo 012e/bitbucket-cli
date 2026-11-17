@@ -13,7 +13,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/avivsinai/bitbucket-cli/internal/config"
 	"github.com/avivsinai/bitbucket-cli/pkg/bbcloud"
 	"github.com/avivsinai/bitbucket-cli/pkg/cmdutil"
 	"github.com/avivsinai/bitbucket-cli/pkg/iostreams"
@@ -24,7 +23,7 @@ func NewCmdPipeline(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "pipeline",
 		Short: "Run and inspect Bitbucket Cloud pipelines (Cloud only)",
-		Long:  "Interact with Bitbucket Cloud Pipelines. Commands are no-ops for Data Center contexts.",
+		Long:  "Interact with Bitbucket Cloud Pipelines. Commands fail with an error for Data Center contexts.",
 	}
 
 	cmd.AddCommand(newRunCmd(f))
@@ -91,7 +90,7 @@ only.
 
 Use --wait to poll the triggered pipeline until it completes, with exponential
 backoff and jitter. Exit codes in --wait mode: 0 = pipeline succeeded,
-1 = pipeline completed unsuccessfully, 8 = timed out while still running.`,
+1 = pipeline completed unsuccessfully, 8 = timed out while still running, 130 = interrupted.`,
 		Example: `  # Run the pipeline on the main branch
   bkt pipeline run
 
@@ -126,7 +125,7 @@ backoff and jitter. Exit codes in --wait mode: 0 = pipeline succeeded,
 	cmd.Flags().StringVar(&opts.Ref, "ref", "main", "Branch to run the pipeline on")
 	cmd.Flags().StringVar(&opts.SelectorType, "selector-type", "", "Pipeline selector type (for example custom or pull-requests)")
 	cmd.Flags().StringVar(&opts.SelectorPattern, "selector-pattern", "", "Pipeline definition name or pattern; omit for default")
-	cmd.Flags().StringSliceVar(&opts.Variables, "var", nil, "Pipeline variable in KEY=VALUE form (repeatable)")
+	cmd.Flags().StringArrayVar(&opts.Variables, "var", nil, "Pipeline variable in KEY=VALUE form (repeatable)")
 	addWaitFlags(cmd, &opts.waitOptions, "Wait for the triggered pipeline to complete")
 
 	return cmd
@@ -203,7 +202,7 @@ pipeline UUID. This command is available for Bitbucket Cloud contexts only.
 
 Use --wait to poll until the pipeline completes, with exponential backoff and
 jitter. Exit codes in --wait mode: 0 = pipeline succeeded, 1 = pipeline
-completed unsuccessfully, 8 = timed out while still running.`,
+completed unsuccessfully, 8 = timed out while still running, 130 = interrupted.`,
 		Example: `  # View pipeline run by build number
   bkt pipeline view 42
 
@@ -274,7 +273,7 @@ func runPipelineRun(cmd *cobra.Command, f *cmdutil.Factory, opts *runOptions) er
 		return err
 	}
 
-	workspace, repo, host, err := resolveCloudRepo(cmd, f, opts.Workspace, opts.Repo)
+	workspace, repo, host, err := cmdutil.ResolveCloudRepo(f, cmd, opts.Workspace, opts.Repo)
 	if err != nil {
 		return err
 	}
@@ -360,7 +359,7 @@ func runPipelineList(cmd *cobra.Command, f *cmdutil.Factory, opts *listOptions) 
 		return err
 	}
 
-	workspace, repo, host, err := resolveCloudRepo(cmd, f, opts.Workspace, opts.Repo)
+	workspace, repo, host, err := cmdutil.ResolveCloudRepo(f, cmd, opts.Workspace, opts.Repo)
 	if err != nil {
 		return err
 	}
@@ -419,7 +418,7 @@ func runPipelineView(cmd *cobra.Command, f *cmdutil.Factory, opts *viewOptions) 
 		return err
 	}
 
-	workspace, repo, host, err := resolveCloudRepo(cmd, f, opts.Workspace, opts.Repo)
+	workspace, repo, host, err := cmdutil.ResolveCloudRepo(f, cmd, opts.Workspace, opts.Repo)
 	if err != nil {
 		return err
 	}
@@ -682,7 +681,7 @@ func runPipelineLogs(cmd *cobra.Command, f *cmdutil.Factory, opts *logsOptions) 
 		return err
 	}
 
-	workspace, repo, host, err := resolveCloudRepo(cmd, f, opts.Workspace, opts.Repo)
+	workspace, repo, host, err := cmdutil.ResolveCloudRepo(f, cmd, opts.Workspace, opts.Repo)
 	if err != nil {
 		return err
 	}
@@ -730,22 +729,4 @@ func defaultPipelineLogStepID(steps []bbcloud.PipelineStep) (string, bool) {
 		return "", false
 	}
 	return steps[len(steps)-1].UUID, true
-}
-
-func resolveCloudRepo(cmd *cobra.Command, f *cmdutil.Factory, workspaceOverride, repoOverride string) (string, string, *config.Host, error) {
-	_, ctxCfg, host, err := cmdutil.ResolveContext(f, cmd, cmdutil.FlagValue(cmd, "context"))
-	if err != nil {
-		return "", "", nil, err
-	}
-	if host.Kind != "cloud" {
-		return "", "", nil, fmt.Errorf("command supports Bitbucket Cloud contexts only")
-	}
-
-	workspace := cmdutil.FirstNonEmpty(workspaceOverride, ctxCfg.Workspace)
-	repo := cmdutil.FirstNonEmpty(repoOverride, ctxCfg.DefaultRepo)
-	if workspace == "" || repo == "" {
-		return "", "", nil, fmt.Errorf("context must supply workspace and repo; use --workspace/--repo if needed")
-	}
-
-	return workspace, repo, host, nil
 }

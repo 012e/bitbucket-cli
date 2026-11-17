@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -36,6 +37,7 @@ type installedSkill struct {
 	sourcePath  string // bitbucket-path in the source repository
 	dir         string // local directory
 	installedBy string // "gh" when the skill carries github-* metadata instead
+	hasMetadata bool   // carries install metadata from any tool
 	metadataErr error
 }
 
@@ -162,7 +164,7 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, opts *updateOptions) erro
 		}
 		var filtered []installedSkill
 		for _, s := range installed {
-			if requested[s.name] {
+			if requested[s.name] || (s.sourcePath != "" && requested[skillNameFromSourcePath(s.sourcePath)]) {
 				filtered = append(filtered, s)
 			}
 		}
@@ -267,26 +269,39 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, opts *updateOptions) erro
 			continue
 		}
 
-		for _, remote := range state.skills {
+		var remote *discovery.Skill
+		for i := range state.skills {
+			cand := &state.skills[i]
 			matched := false
 			if s.sourcePath != "" {
-				matched = remote.Path == s.sourcePath
+				matched = cand.Path == s.sourcePath
 			} else {
-				matched = remote.InstallName() == s.name || remote.Name == s.name
+				matched = cand.InstallName() == s.name || cand.Name == s.name
 			}
-			if !matched {
-				continue
-			}
-			newCommit, commitErr := state.repo.LatestCommit(ctx, state.resolved.SHA, remote.Path)
-			if commitErr != nil {
-				checkFailed = true
-				fmt.Fprintf(ios.ErrOut, "! Skipping %s: could not determine latest commit: %v\n", s.name, commitErr)
+			if matched {
+				remote = cand
 				break
 			}
-			if newCommit != s.commit || opts.Force {
-				updates = append(updates, pendingUpdate{local: s, repo: state.repo, resolved: state.resolved, skill: remote, newCommit: newCommit})
+		}
+		if remote == nil && s.sourcePath != "" {
+			// Installed by an exact path outside the discovery conventions.
+			if direct, directErr := discovery.DiscoverSkillByPath(ctx, state.repo, state.resolved.SHA, s.sourcePath, discovery.DiscoverSkillByPathOptions{SkipDescription: true}); directErr == nil {
+				remote = direct
 			}
-			break
+		}
+		if remote == nil {
+			checkFailed = true
+			fmt.Fprintf(ios.ErrOut, "! %s: not found in %s\n", s.name, s.repoURL)
+			continue
+		}
+		newCommit, commitErr := state.repo.LatestCommit(ctx, state.resolved.SHA, remote.Path)
+		if commitErr != nil {
+			checkFailed = true
+			fmt.Fprintf(ios.ErrOut, "! Skipping %s: could not determine latest commit: %v\n", s.name, commitErr)
+			continue
+		}
+		if newCommit != s.commit || opts.Force {
+			updates = append(updates, pendingUpdate{local: s, repo: state.repo, resolved: state.resolved, skill: *remote, newCommit: newCommit})
 		}
 	}
 	stop()
@@ -530,6 +545,11 @@ func scanAllAgentsForUpdate(gitRoot, homeDir string) []installedSkill {
 			if err != nil {
 				continue
 			}
+			if scanFilterForAgentHost(host, scope) == scanInstalledOnly {
+				// This directory also holds the skills the repository
+				// authors; only installed ones can be updated.
+				skills = slices.DeleteFunc(skills, func(s installedSkill) bool { return !s.hasMetadata })
+			}
 			all = append(all, skills...)
 		}
 	}
@@ -585,6 +605,7 @@ func parseInstalledSkill(data []byte, name, dir string) installedSkill {
 	if meta == nil {
 		return s
 	}
+	s.hasMetadata = hasInstallMetadata(meta)
 	str := func(key string) string {
 		v, _ := meta[key].(string)
 		return v

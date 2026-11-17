@@ -78,6 +78,7 @@ limitations are noted in each subcommand's help.`,
 	cmd.AddCommand(newReactionCmd(f))
 	cmd.AddCommand(newSuggestionCmd(f))
 	cmd.AddCommand(newChecksCmd(f))
+	cmd.AddCommand(newMergeabilityCmd(f))
 	cmd.AddCommand(newPublishCmd(f))
 
 	return cmd
@@ -204,33 +205,24 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, opts *listOptions) error {
 		}
 
 		var prs []bbdc.PullRequest
-		if opts.Reviewer {
-			// Apply the REVIEWER participant filter upstream (before the limit)
+		if opts.Reviewer || opts.Mine {
+			role := "AUTHOR"
+			if opts.Reviewer {
+				role = "REVIEWER"
+			}
+			// Apply the participant filter upstream (before the limit)
 			// rather than filtering a limited page client-side.
 			prs, err = client.ListPullRequestsWithOptions(ctx, projectKey, repoSlug, bbdc.RepoPullRequestsOptions{
 				State:    opts.State,
-				Role:     "REVIEWER",
+				Role:     role,
 				Username: me.Name,
 				Limit:    opts.Limit,
 			})
-			if err != nil {
-				return err
-			}
 		} else {
 			prs, err = client.ListPullRequests(ctx, projectKey, repoSlug, opts.State, opts.Limit)
-			if err != nil {
-				return err
-			}
-
-			if opts.Mine {
-				filtered := prs[:0]
-				for _, pr := range prs {
-					if isSameDCUser(pr.Author.User, *me) {
-						filtered = append(filtered, pr)
-					}
-				}
-				prs = filtered
-			}
+		}
+		if err != nil {
+			return err
 		}
 
 		payload := map[string]any{
@@ -723,6 +715,17 @@ func runView(cmd *cobra.Command, f *cmdutil.Factory, opts *viewOptions) error {
 					return err
 				}
 			}
+
+			if len(pr.Reviewers) > 0 {
+				if _, err := fmt.Fprintln(ios.Out, "\nReviewers:"); err != nil {
+					return err
+				}
+				for _, reviewer := range pr.Reviewers {
+					if _, err := fmt.Fprintf(ios.Out, "  %s\n", cmdutil.FirstNonEmpty(reviewer.Display, reviewer.Username)); err != nil {
+						return err
+					}
+				}
+			}
 			return nil
 		})
 
@@ -1051,7 +1054,7 @@ via the --draft flag.`,
   bkt pr create --title "Add OAuth2 support" --description "Implements RFC 6749"
 
   # Create with reviewers and close source branch on merge
-  bkt pr create -t "Fix login bug" --reviewer alice --reviewer bob --close-source
+  bkt pr create --title "Fix login bug" --reviewer alice --reviewer bob --close-source
 
   # Create a draft pull request
   bkt pr create --title "WIP: new feature" --draft
@@ -1244,6 +1247,14 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, opts *createOptions) erro
 }
 
 func applyCreateDefaults(ctx context.Context, opts *createOptions, host *config.Host) error {
+	// Commits for the default title come from the branch the user named with
+	// --source when git can resolve it locally, otherwise from HEAD.
+	titleRef := "HEAD"
+	if src := strings.TrimSpace(opts.Source); src != "" {
+		if _, err := runGitOutput(ctx, "rev-parse", "--verify", "--quiet", src+"^{commit}"); err == nil {
+			titleRef = src
+		}
+	}
 	if strings.TrimSpace(opts.Source) == "" {
 		source, err := currentGitBranch(ctx)
 		if err != nil {
@@ -1270,7 +1281,7 @@ func applyCreateDefaults(ctx context.Context, opts *createOptions, host *config.
 				remoteName = rn
 			}
 		}
-		title, err := defaultGitPRTitle(ctx, opts.Target, remoteName)
+		title, err := defaultGitPRTitle(ctx, opts.Target, remoteName, titleRef)
 		if err != nil {
 			return fmt.Errorf("could not determine default --title from git history; pass --title explicitly: %w", err)
 		}
@@ -1319,18 +1330,18 @@ func defaultGitTargetBranch(ctx context.Context, host *config.Host) (branch stri
 	return branch, remoteName, nil
 }
 
-func defaultGitPRTitle(ctx context.Context, targetBranch, remoteName string) (string, error) {
+func defaultGitPRTitle(ctx context.Context, targetBranch, remoteName, sourceRef string) (string, error) {
 	baseRef, err := resolveGitBaseRef(ctx, targetBranch, remoteName)
 	if err != nil {
 		return "", err
 	}
 
-	mergeBase, err := runGitOutput(ctx, "merge-base", "HEAD", baseRef)
+	mergeBase, err := runGitOutput(ctx, "merge-base", sourceRef, baseRef)
 	if err != nil {
 		return "", err
 	}
 
-	out, err := runGitOutput(ctx, "log", "--reverse", "--format=%s", fmt.Sprintf("%s..HEAD", strings.TrimSpace(mergeBase)))
+	out, err := runGitOutput(ctx, "log", "--reverse", "--format=%s", fmt.Sprintf("%s..%s", strings.TrimSpace(mergeBase), sourceRef))
 	if err != nil {
 		return "", err
 	}
@@ -3063,7 +3074,7 @@ the source branch's latest commit. On Cloud, the source commit hash from the
 pull request is used.
 
 Exit codes in --wait mode: 0 = all passed, 1 = a build failed,
-8 = timed out with builds still pending.`,
+8 = timed out with builds still pending, 130 = interrupted.`,
 		Example: `  # Show current build status
   bkt pr checks 42
 
@@ -3306,11 +3317,15 @@ func executeStatusCheck(r *checksResult) error {
 			// Check if any builds are still pending
 			timedOutWithPending = !allBuildsComplete(statuses)
 		}
+		// A wait that timed out still reports the last statuses it saw.
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
 	} else {
 		statuses, err = r.fetchFunc()
-	}
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		return err
+		if err != nil {
+			return err
+		}
 	}
 
 	r.payload["statuses"] = statuses

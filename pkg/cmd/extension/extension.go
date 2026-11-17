@@ -28,6 +28,11 @@ func validateExtensionName(name string) error {
 	if strings.Contains(name, "/") || strings.Contains(name, "\\") || strings.Contains(name, "..") {
 		return fmt.Errorf("invalid extension name %q: must not contain path separators or '..'", name)
 	}
+	// "." names the extensions directory itself, and Windows drops trailing
+	// dots and spaces from a path segment, so ". " names it there too.
+	if strings.Trim(name, ". ") == "" {
+		return fmt.Errorf("invalid extension name %q: must not be only dots or spaces", name)
+	}
 	return nil
 }
 
@@ -171,6 +176,9 @@ stripped from the environment before the extension process starts.`,
 			return runExtensionExec(cmd, f, args[0], args[1:])
 		},
 	}
+	// Everything after the extension name belongs to the extension, flags
+	// included.
+	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 
@@ -362,7 +370,14 @@ func runExtensionExec(cmd *cobra.Command, f *cmdutil.Factory, name string, args 
 		fmt.Sprintf("BKT_EXTENSION_NAME=%s", name),
 	)
 
-	return cmdExec.Run()
+	err = cmdExec.Run()
+	var exitErr *exec.ExitError
+	// Pass the extension's own exit code through without an extra message.
+	// A negative code means a signal ended it; that stays an ordinary error.
+	if errors.As(err, &exitErr) && exitErr.ExitCode() >= 0 {
+		return &cmdutil.ExitError{Code: exitErr.ExitCode()}
+	}
+	return err
 }
 
 func extensionRoot(f *cmdutil.Factory) (string, error) {

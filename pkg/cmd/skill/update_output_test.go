@@ -17,16 +17,8 @@ import (
 	"github.com/avivsinai/bitbucket-cli/pkg/cmdutil"
 )
 
-func isolateUpdateHome(t *testing.T) {
-	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-}
-
 func runUpdateJSON(t *testing.T, args ...string) (string, string, error) {
 	t.Helper()
-	isolateUpdateHome(t)
 	f, stdout, stderr := newTestFactory(t)
 	root := &cobra.Command{Use: "bkt"}
 	root.PersistentFlags().Bool("json", false, "")
@@ -81,7 +73,6 @@ func TestUpdateJSONEmptyResultsAreArray(t *testing.T) {
 }
 
 func TestUpdateRuntimeFailureIsNotUpToDateSuccess(t *testing.T) {
-	isolateUpdateHome(t)
 	repo := newSkillsRepo()
 	repo.Err = errors.New("service unavailable")
 	stubRepository(t, repo)
@@ -105,7 +96,6 @@ func TestUpdateMixedRepositoriesProcessesHealthyAndReturnsFailure(t *testing.T) 
 			name = "dry run"
 		}
 		t.Run(name, func(t *testing.T) {
-			isolateUpdateHome(t)
 			healthy := newSkillsRepo()
 			original := openRepositoryFunc
 			openRepositoryFunc = func(_ *cobra.Command, _ *cmdutil.Factory, arg string) (source.Repository, error) {
@@ -203,5 +193,41 @@ func TestRestoreBackupFailurePreservesRecoveryDirectory(t *testing.T) {
 	data, readErr := os.ReadFile(filepath.Join(backup, "keep"))
 	if readErr != nil || string(data) != "previous" {
 		t.Fatalf("backup was not preserved: data=%q err=%v", data, readErr)
+	}
+}
+
+// Before the fix `bkt skill update monalisa/triage` failed with "none of the
+// specified skills are installed", though list and install show that name.
+func TestUpdateNamedNamespacedSkill(t *testing.T) {
+	f, stdout, stderr := newTestFactory(t)
+	stubRepository(t, newSkillsRepo())
+	dir := t.TempDir()
+	installedSkillDir(t, dir, "triage", "    bitbucket-repo: https://bitbucket.org/myteam/agent-skills\n    bitbucket-commit: old\n    bitbucket-path: skills/monalisa/triage\n")
+
+	if err := runSkill(t, f, stdout, stderr, "update", "--dir", dir, "--all", "monalisa/triage"); err != nil {
+		t.Fatalf("update: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout.String(), "✓ Updated triage") {
+		t.Fatalf("stdout = %q", stdout)
+	}
+}
+
+// Before the fix a skill deleted or moved upstream was skipped silently and the
+// run ended with "All skills are up to date." and exit 0.
+func TestUpdateSkillGoneFromRepositoryFails(t *testing.T) {
+	f, stdout, stderr := newTestFactory(t)
+	stubRepository(t, newSkillsRepo())
+	dir := t.TempDir()
+	installedSkillDir(t, dir, "gamma", "    bitbucket-repo: https://bitbucket.org/myteam/agent-skills\n    bitbucket-commit: old\n    bitbucket-path: skills/gamma\n")
+
+	err := runSkill(t, f, stdout, stderr, "update", "--dir", dir, "--all")
+	if err == nil {
+		t.Fatalf("expected an error (stderr=%s)", stderr)
+	}
+	if !strings.Contains(stderr.String(), "! gamma: not found in https://bitbucket.org/myteam/agent-skills") {
+		t.Errorf("stderr = %q", stderr)
+	}
+	if strings.Contains(stderr.String(), "All skills are up to date") {
+		t.Errorf("reported up to date: %s", stderr)
 	}
 }

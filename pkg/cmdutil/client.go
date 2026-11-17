@@ -80,14 +80,15 @@ func newCloudClient(host *config.Host, enableOAuthRefresh bool) (*bbcloud.Client
 	if host.AuthMethod != "oauth" {
 		opts.AuthMethod = host.AuthMethod
 	}
-	if host.AuthMethod == "oauth" && (!enableOAuthRefresh || secret.TokenFromEnv() == "") {
+	// Keyring-stored OAuth tokens use Bearer auth. When BKT_TOKEN overrides,
+	// the caller controls the token type and the auth method defaults to
+	// basic (matching API-token behavior), for frozen clients too.
+	keyringOAuth := host.AuthMethod == "oauth" && secret.TokenFromEnv() == ""
+	if keyringOAuth {
 		opts.AuthMethod = "bearer"
 	}
-	if enableOAuthRefresh && host.AuthMethod == "oauth" && secret.TokenFromEnv() == "" {
-		// Keyring-stored OAuth tokens use Bearer auth + auto-refresh.
-		// When BKT_TOKEN overrides, the caller controls the token type
-		// and auth method defaults to basic (matching API-token behavior).
-		hostKey, err := HostKeyFromURL(host.BaseURL)
+	if enableOAuthRefresh && keyringOAuth {
+		hostKey, err := credentialKey(host)
 		if err != nil {
 			return nil, fmt.Errorf("resolve host key: %w", err)
 		}
@@ -95,6 +96,16 @@ func newCloudClient(host *config.Host, enableOAuthRefresh bool) (*bbcloud.Client
 	}
 
 	return bbcloud.New(opts)
+}
+
+// credentialKey returns the key that a host's token is stored under: its own
+// config key, which may be an alias (the base URL names the server, not the
+// account), or the server's key for a host that did not come from the config.
+func credentialKey(host *config.Host) (string, error) {
+	if key := host.Key(); key != "" {
+		return key, nil
+	}
+	return HostKeyFromURL(host.BaseURL)
 }
 
 // oauthTokenRefresher returns a function that refreshes the OAuth token and
@@ -131,7 +142,7 @@ func oauthTokenRefresher(hostKey string, host *config.Host) func(ctx context.Con
 			}
 			clients, err := oauth.CloudClientsFor(tok)
 			if err != nil {
-				return fmt.Errorf("refresh OAuth token for %s: %w", hostKey, err)
+				return fmt.Errorf("refresh OAuth token for %s (re-login with `bkt auth login %s --kind cloud --web`): %w", hostKey, LoginTarget(hostKey, host), err)
 			}
 
 			var newTok *oauth.Token
@@ -147,7 +158,7 @@ func oauthTokenRefresher(hostKey string, host *config.Host) func(ctx context.Con
 				}
 			}
 			if err != nil {
-				return fmt.Errorf("refresh failed (re-login with `bkt auth login --web`): %w", err)
+				return fmt.Errorf("refresh failed (re-login with `bkt auth login %s --kind cloud --web`): %w", LoginTarget(hostKey, host), err)
 			}
 
 			blob, err := newTok.Marshal()

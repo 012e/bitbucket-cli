@@ -1560,22 +1560,6 @@ func TestWithoutTokenRefresher401ReturnsError(t *testing.T) {
 	}
 }
 
-func TestNewRequestAbsoluteURL(t *testing.T) {
-	client, err := New(Options{BaseURL: "https://example.com"})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	req, err := client.NewRequest(context.Background(), http.MethodGet, "https://other.com/api/test", nil)
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-
-	if got := req.URL.String(); got != "https://other.com/api/test" {
-		t.Fatalf("expected absolute URL to be preserved, got %s", got)
-	}
-}
-
 func TestConcurrent401RefreshCoalesced(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "Bearer new-token" {
@@ -1759,5 +1743,73 @@ func TestFollowerRetriesWhenLeaderContextCancelled(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&refreshCalls); got != 2 {
 		t.Fatalf("TokenRefresher called %d times, want 2 (failed leader + follower replacement)", got)
+	}
+}
+
+// Before the fix a 429 with Retry-After longer than the request deadline made
+// the client wait out the deadline and report "context deadline exceeded"
+// instead of the 429.
+func TestClientRetryAfterBeyondDeadlineReturnsHTTPError(t *testing.T) {
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := New(Options{
+		BaseURL: server.URL,
+		Retry:   RetryPolicy{MaxAttempts: 3, InitialBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := client.NewRequest(ctx, http.MethodGet, "/limited", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	err = client.Do(req, nil)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("err = %v, want *HTTPError with status 429", err)
+	}
+	if hits != 1 {
+		t.Fatalf("server saw %d requests, want 1", hits)
+	}
+}
+
+// `bkt api https://other.example.com/x` used to send the stored token to
+// other.example.com; an http:// URL to the same host sent it in clear text.
+func TestNewRequestRefusesAnotherOrigin(t *testing.T) {
+	client, err := New(Options{BaseURL: "https://bitbucket.example.com/context"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, target := range []string{
+		"https://other.example.com/rest/api/1.0/projects",
+		"http://bitbucket.example.com/rest/api/1.0/projects",
+		"https://bitbucket.example.com:8443/rest/api/1.0/projects",
+		"//other.example.com/rest/api/1.0/projects",
+	} {
+		if _, err := client.NewRequest(context.Background(), http.MethodGet, target, nil); err == nil {
+			t.Errorf("NewRequest(%q) succeeded; want a refusal", target)
+		}
+	}
+	for _, target := range []string{
+		"https://BITBUCKET.example.com/context/rest/api/1.0/projects?limit=1",
+		"https://bitbucket.example.com:443/context/rest/api/1.0/projects?limit=1",
+	} {
+		req, err := client.NewRequest(context.Background(), http.MethodGet, target, nil)
+		if err != nil {
+			t.Fatalf("NewRequest(%q) for the configured origin: %v", target, err)
+		}
+		if got := req.URL.String(); got != target {
+			t.Fatalf("URL = %q, want %q", got, target)
+		}
 	}
 }

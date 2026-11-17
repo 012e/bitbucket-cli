@@ -6,6 +6,148 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-11-16
+### Added
+- `bkt auth status` names each host alias in front of its base URL, so
+  accounts on the same server can be told apart. Thanks to Kristof Lemmens
+  (@kristoflemmens) for the implementation.
+
+
+## [0.40.0] - 2026-11-16
+### Added
+- `bkt auth login --alias <name>` stores a login under its own host entry and
+  keychain item, so one server can be used with several accounts, for example
+  two Bitbucket Cloud accounts. A context selects the account with
+  `bkt context create <name> --host <alias>`. Thanks to Kristof Lemmens
+  (@kristoflemmens) for the original implementation.
+
+### Fixed
+- Host aliases reject collisions with other deployments before credential
+  verification or storage, and OAuth recovery hints retain the selected alias.
+- The OAuth token of a host entry whose key is not the server's own host name
+  is refreshed from that entry's keychain item. It used to read the server's
+  item after a 401, so an aliased context could select another stored account.
+- Cloud pull request merges follow the task-status URL in HTTP 202's Location
+  header, including responses with an empty or string body. Accepted work without
+  valid tracking information reports unknown completion instead of "Merged".
+- Merge submission and task polling refuse redirects. Invalid synchronous
+  responses and inconclusive polling preserve uncertainty about completion.
+- Conditional merge-task polling honors the cached status after HTTP 304
+  revalidation and continues until the task completes.
+
+
+## [0.39.0] - 2026-11-14
+### Security
+- `BKT_TOKEN` is no longer sent to a host other than `BKT_HOST`. With an active
+  context for another host, `bkt` used to ignore `BKT_HOST` and send the token
+  to the context's host. The `BKT_HOST` + `BKT_TOKEN` pair now wins over the
+  active context, and an explicit `--context` or `--host` for another host is
+  refused.
+- `bkt api` and every other request refuse an absolute URL for another host,
+  port, or scheme. `bkt api https://other.example.com/x` used to send the
+  stored token to that host.
+- `bkt auth login` for a Data Center host now uses bearer auth unless
+  `--auth-method basic` is given. A Data Center server can answer 401 to a path
+  outside a REST plugin even with correct credentials, and under basic auth
+  such answers can count as failed password logins until the account is
+  locked. An existing basic host keeps working; `bkt auth doctor` names the
+  command that switches it to a bearer token.
+- `bkt api` on a Data Center host refuses a path that is not ASCII or not of the
+  form `/rest/<name>/<version>/...` (for example `/rest/api.lookup/projects`),
+  and sends no request.
+
+### Fixed
+- A config save (for example `bkt context create`) no longer deletes a legacy
+  plaintext token from `config.yml` before `bkt auth login` has moved it to the
+  keychain.
+- The browser login no longer hangs for two seconds, or leaks a handler, when
+  the callback page is reloaded; token and user-info calls time out after 30
+  seconds instead of waiting forever while they hold the refresh lock.
+- `bkt auth status` under `BKT_TOKEN` shows the saved auth method (for example
+  `bearer`) when `BKT_AUTH_METHOD` is unset. It used to print `basic`.
+- `bkt skill install` and `bkt skill update` keep the body of a SKILL.md whose
+  frontmatter is empty (`---` then `---`). Before, text up to the next `---`
+  rule was lost or a second frontmatter block was written.
+- `bkt skill update monalisa/triage` accepts the `namespace/name` shown by
+  `skill list`. It used to fail with "none of the specified skills are installed".
+- `bkt skill update` reports `! <name>: not found in <repo>` and exits non-zero
+  for a skill that no longer exists in its repository. It used to print
+  "All skills are up to date." and exit 0.
+- A 429 or 503 with a `Retry-After` longer than the request deadline returns
+  the HTTP error at once. It used to wait and report "context deadline exceeded".
+- Docs name the per-OS config directory (macOS and Windows differ from
+  `~/.config/bkt`); the security issue link points at the security policy.
+- Ctrl-C or SIGTERM makes bkt exit 130 with no error text. `pipeline run --wait`
+  and `pr checks --wait` used to exit 0, and other commands printed "Error:
+  context canceled" and exited 1.
+- `bkt extension exec` exits with the extension's own exit code and no extra
+  message. It used to print "Error: exit status N" and exit 1.
+- `bkt pipeline run --var LIST=a,b` keeps the comma in the value. It used to
+  fail with `invalid variable "b"`.
+- `bkt status rate-limit` prints "No rate-limit headers returned by HOST." when
+  the server sends none. It used to print "Limit: 0 / Remaining: 0".
+- Data Center `status commit`, `status pr`, `repo list` and `repo view` retry
+  transient failures like the other commands. They used to make one attempt.
+- `bkt pr create --source BRANCH` builds the default title from BRANCH's
+  commits. It used to read the current HEAD.
+- Bitbucket Cloud `bkt pr view` lists reviewers, as the Data Center view does.
+- `--json` prints `[]` for empty hosts, contexts, repositories, default
+  reviewers and variables. It used to print `null`.
+- `bkt repo downloads upload` rejects two files with the same base name before
+  uploading. The second used to silently replace the first.
+- `bkt variable set --env-file` applies variables in file order, and a failure
+  names the variables already applied.
+- `bkt pr checks` without `--wait` reports a timed-out status request as an
+  error. It used to print "No builds found." and exit 0.
+- Data Center `bkt pr list --mine` on a repository asks Bitbucket for the
+  author's pull requests, so `--limit` applies to them. It used to filter the
+  newest `--limit` pull requests of all authors.
+- `bkt mcp serve` sends a `BKT_TOKEN` override of an OAuth-saved Cloud host
+  with basic auth, as every other command does. It used to send it as a bearer
+  token, and every tool failed with `auth_failed`.
+- `bkt variable set NAME` drops a CRLF line ending from a piped value. The
+  stored value used to keep the `\r`.
+- `bkt skill update` no longer treats the skills a repository authors under
+  `skills/` as installed skills that lack metadata.
+- A config entry with no fields (`contexts: {work: }`) no longer crashes every
+  command.
+- `bkt extension remove .` is rejected. It used to delete every installed
+  extension.
+- `bkt extension exec <name> --flag` forwards flags to the extension. It used
+  to fail with "unknown flag".
+- A Data Center remote under a context path
+  (`https://host/bitbucket/scm/PROJ/repo.git`) resolves to the right project
+  and repository.
+- A blank `PAGER` no longer crashes commands that page their output.
+- Help examples: `--json` replaces a `--output json` flag that does not exist
+  (`auth status`, `context list`, `status`, `perms`, `admin logging get`),
+  `pr create` uses `--title`, the Cloud `context create` examples use
+  `--host api.bitbucket.org`, and the `api` example drops a `--workspace` flag
+  that does not exist.
+
+
+## [0.38.1] - 2026-11-09
+### Fixed
+- Fetch newly created release tags into the packaging checkout before GoReleaser
+  runs. v0.38.0 created its tag but stopped before publishing binaries because
+  GoReleaser selected v0.37.0. This release publishes the mergeability command
+  and Cloud state-filtering fixes documented under 0.38.0 below.
+
+
+## [0.38.0] - 2026-11-09
+### Added
+- `bkt pr mergeability <id>` reports read-only Bitbucket Cloud merge eligibility,
+  conflicts, blocking checks, and unknown results in text or structured output (#382).
+- Maintainers can cut a release from GitHub Actions (`release-request.yml`)
+  instead of running `scripts/release.sh` locally.
+
+### Fixed
+- Bitbucket Cloud repository-scoped PR lists honor `--state` even when the API
+  ignores it with `--reviewer` or `--mine`, filtering before pagination limits (#380).
+- Bitbucket Cloud `bkt pr list --mine` honors `--state` even when the workspace
+  API returns PRs in other states, and applies `--limit` to matching PRs (#377).
+
+
 ## [0.37.0] - 2026-10-25
 ### Changed
 - **Log in again once:** run `bkt auth login https://bitbucket.org --kind cloud --web`.
@@ -865,7 +1007,12 @@ All notable changes to this project will be documented here. The format follows
 ## [0.1.0] - 2025-10-26
 - Initial public release of `bkt`.
 
-[Unreleased]: https://github.com/avivsinai/bitbucket-cli/compare/v0.37.0...HEAD
+[Unreleased]: https://github.com/avivsinai/bitbucket-cli/compare/v0.40.1...HEAD
+[0.40.1]: https://github.com/avivsinai/bitbucket-cli/compare/v0.40.0...v0.40.1
+[0.40.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.39.0...v0.40.0
+[0.39.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.38.1...v0.39.0
+[0.38.1]: https://github.com/avivsinai/bitbucket-cli/compare/v0.38.0...v0.38.1
+[0.38.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/avivsinai/bitbucket-cli/compare/v0.35.2...v0.36.0
 [0.35.2]: https://github.com/avivsinai/bitbucket-cli/compare/v0.35.1...v0.35.2

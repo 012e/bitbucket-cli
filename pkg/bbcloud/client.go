@@ -677,13 +677,6 @@ func (c *Client) ListPipelineSteps(ctx context.Context, workspace, repoSlug, pip
 	return steps, nil
 }
 
-// PipelineLog represents a step log chunk.
-type PipelineLog struct {
-	StepUUID string `json:"step_uuid"`
-	Type     string `json:"type"`
-	Log      string `json:"log"`
-}
-
 // CommitStatus describes build status for a commit.
 // Type alias to shared types.CommitStatus for backward compatibility.
 type CommitStatus = types.CommitStatus
@@ -844,6 +837,7 @@ func (c *Client) ListWorkspacePullRequestsPage(ctx context.Context, workspace, u
 		return nil, fmt.Errorf("username is required")
 	}
 
+	var path string
 	if next != "" {
 		endpoint := fmt.Sprintf("/workspaces/%s/pullrequests/%s",
 			url.PathEscape(workspace), url.PathEscape(username))
@@ -851,25 +845,25 @@ func (c *Client) ListWorkspacePullRequestsPage(ctx context.Context, workspace, u
 		if err != nil {
 			return nil, err
 		}
-		return c.fetchPullRequestsPage(ctx, normalized)
+		path = normalized
+	} else {
+		pageLen := opts.Limit
+		if pageLen <= 0 || pageLen > 100 {
+			pageLen = 20
+		}
+
+		var params []string
+		params = append(params, fmt.Sprintf("pagelen=%d", pageLen))
+		params = append(params, pullRequestStateParams(opts.State)...)
+
+		path = fmt.Sprintf("/workspaces/%s/pullrequests/%s?%s",
+			url.PathEscape(workspace),
+			url.PathEscape(username),
+			strings.Join(params, "&"),
+		)
 	}
 
-	pageLen := opts.Limit
-	if pageLen <= 0 || pageLen > 100 {
-		pageLen = 20
-	}
-
-	var params []string
-	params = append(params, fmt.Sprintf("pagelen=%d", pageLen))
-	params = append(params, pullRequestStateParams(opts.State)...)
-
-	path := fmt.Sprintf("/workspaces/%s/pullrequests/%s?%s",
-		url.PathEscape(workspace),
-		url.PathEscape(username),
-		strings.Join(params, "&"),
-	)
-
-	return c.fetchPullRequestsPage(ctx, path)
+	return c.fetchPullRequestsPageForState(ctx, path, opts.State)
 }
 
 // ListWorkspacePullRequests lists pull requests authored by the specified user across all repositories in the workspace.
